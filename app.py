@@ -1,192 +1,97 @@
 import os
-import base64
-import tempfile
-
 import numpy as np
 import librosa
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-app = Flask(__name__)
-CORS(app)
-
-# =====================
-# Fingerprint parameters
-# =====================
+# ==== Audio / fingerprint settings ====
 TARGET_SR = 22050
+N_FFT = 2048
 HOP_LENGTH = 512
-N_MELS = 64
 
-# =====================
-# Load fingerprints.npz
-# =====================
-print("Loading fingerprints.npz ...")
-data = np.load("fingerprints.npz", allow_pickle=True)
+# ==== Load fingerprints.npz ====
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FP_PATH = os.path.join(BASE_DIR, "fingerprints.npz")
 
-FEATURE_KEYS = ["feats", "fingerprints", "features", "fps"]
-FEATS = None
-USED_KEY = None
+if not os.path.exists(FP_PATH):
+    raise FileNotFoundError(f"fingerprints.npz not found at {FP_PATH}")
 
-for k in FEATURE_KEYS:
+data = np.load(FP_PATH, allow_pickle=True)
+
+feature_key = None
+for k in ("feats", "fingerprints", "features", "fps"):
     if k in data:
-        FEATS = data[k]
-        USED_KEY = k
+        feature_key = k
         break
 
-if FEATS is None:
-    raise KeyError(
-        "fingerprints.npz missing feature array "
-        "(expected one of: feats, fingerprints, features, fps)"
-    )
+if feature_key is None:
+    raise KeyError("fingerprints.npz missing feature array (expected one of: feats, fingerprints, features, fps)")
 
-if "names" in data:
-    NAMES = data["names"].tolist()
-else:
-    NAMES = [f"Track {i}" for i in range(FEATS.shape[0])]
+FEATS = data[feature_key]           # shape: (num_tracks, feature_dim)
+NAMES = data["names"].tolist()      # list of track names
 
-print(f"Loaded fingerprints from key '{USED_KEY}'")
-print(f"Loaded {FEATS.shape[0]} fingerprints from fingerprints.npz")
+print(f"Loaded fingerprints from key '{feature_key}'")
+print(f"Loaded {len(NAMES)} fingerprints from fingerprints.npz")
 
-# Make sure FEATS is 2D: (num_tracks, feature_dim)
-FEATS = np.asarray(FEATS)
-if FEATS.ndim != 2:
-    raise ValueError(f"FEATS must be 2D, got shape {FEATS.shape}")
+# Precompute norms for cosine similarity
+FEATS = np.asarray(FEATS, dtype=np.float32)
+NORMS = np.linalg.norm(FEATS, axis=1) + 1e-9
 
-
-# =====================
-# Helper: fingerprint for an audio file
-# =====================
-
+# ==== Helper to make fingerprint from an audio file ====
 def make_fingerprint(path: str) -> np.ndarray:
     """
-    Load audio from 'path', compute a simple log-mel mean feature vector.
-    Returns: np.ndarray of shape (N_MELS,)
+    Load audio from 'path' and compute a simple chroma-based fingerprint.
     """
     y, sr = librosa.load(path, sr=TARGET_SR, mono=True)
     if y.size == 0:
-        raise ValueError("Empty audio after loading")
+        raise ValueError("Empty audio")
 
-    mels = librosa.feature.melspectrogram(
-        y=y,
-        sr=sr,
-        n_mels=N_MELS,
-        hop_length=HOP_LENGTH,
-    )
-    logmel = librosa.power_to_db(mels + 1e-10)
-    feat = logmel.mean(axis=1)  # (N_MELS,)
-    return feat
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+    fp = chroma.mean(axis=1)  # (12,)
+    fp = fp.astype(np.float32)
+    n = np.linalg.norm(fp) + 1e-9
+    fp /= n
+    return fp
 
+# ==== Flask app ====
+app = Flask(__name__)
+CORS(app)
 
-def best_match(query_feat: np.ndarray):
-    """
-    Compare query_feat to all FEATS using cosine similarity.
-    Returns: (best_index, similarity_score)
-    """
-    q = query_feat / (np.linalg.norm(query_feat) + 1e-8)
-    f = FEATS / (np.linalg.norm(FEATS, axis=1, keepdims=True) + 1e-8)
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
 
-    sims = f @ q
-    idx = int(np.argmax(sims))
-    score = float(sims[idx])
-    return idx, score
+@app.route("/tracks", methods=["GET"])
+def tracks():
+    """Optional: list known track names."""
+    return jsonify({"tracks": NAMES}), 200
 
-
-# =====================
-# Health check
-# =====================
-
-@app.route("/")
-def index():
-    return jsonify(
-        {
-            "status": "ok",
-            "tracks": len(NAMES),
-        }
-    )
-
-
-# =====================
-# /match endpoint
-# =====================
-
+# =============== TEMP DEBUG /match ===============
 @app.route("/match", methods=["POST"])
 def match():
     """
-    Accepts audio as:
-      1) JSON:  {"audio": "data:audio/webm;base64,AAA..."}
-      2) multipart/form-data:  file field named "audio"
-      3) raw binary body: Content-Type like "audio/webm" or similar
+    TEMP DEBUG VERSION:
 
-    Returns JSON:
-      { "match": "<track name>", "score": 0.92 }
+    Instead of trying to decode audio and match it, we just report what
+    the server actually receives from the client.
     """
-    raw_bytes = None
+
     content_type = request.content_type or ""
+    raw = request.get_data(cache=False)
 
-    # --------- Case 1: JSON ----------
-    if request.is_json:
-        data = request.get_json(silent=True) or {}
-        audio_b64 = data.get("audio")
+    info = {
+        "content_type": content_type,
+        "num_bytes": len(raw),
+        "has_files": bool(request.files),
+        "file_keys": list(request.files.keys()),
+    }
 
-        if not audio_b64:
-            return jsonify({"error": "Missing 'audio' field in JSON"}), 400
-
-        try:
-            if "," in audio_b64:
-                audio_b64 = audio_b64.split(",", 1)[1]
-            raw_bytes = base64.b64decode(audio_b64)
-        except Exception as e:
-            return jsonify({"error": f"Invalid base64 audio: {e}"}), 400
-
-    # --------- Case 2: multipart/form-data ----------
-    elif "multipart/form-data" in content_type.lower():
-        if "audio" not in request.files:
-            return jsonify(
-                {"error": "No 'audio' file found in multipart/form-data"}
-            ), 400
-        file = request.files["audio"]
-        raw_bytes = file.read()
-
-    # --------- Case 3: raw binary body (e.g. audio/webm) ----------
-    else:
-        # e.g. fetch(url, { method: "POST", body: blob });
-        raw_bytes = request.get_data(cache=False)
-
-    if not raw_bytes:
-        return jsonify(
-            {
-                "error": f"Empty audio payload (content_type={content_type})"
-            }
-        ), 400
-
-    # --------- Save to temp .webm and fingerprint ----------
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
-            tmp.write(raw_bytes)
-            tmp_path = tmp.name
-
-        query_feat = make_fingerprint(tmp_path)
-        idx, score = best_match(query_feat)
-
-        return jsonify(
-            {
-                "match": NAMES[idx],
-                "score": score,
-            }
-        )
-
-    except Exception as e:
-        return jsonify({"error": f"Failed to process audio: {e}"}), 500
-
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+    # You will see this JSON in the scanner "Result" box
+    return jsonify(info), 200
+# =================================================
 
 
 if __name__ == "__main__":
+    # Local dev only
     app.run(host="0.0.0.0", port=5000, debug=True)
