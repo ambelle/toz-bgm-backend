@@ -53,6 +53,7 @@ FEATS = np.asarray(FEATS)
 if FEATS.ndim != 2:
     raise ValueError(f"FEATS must be 2D, got shape {FEATS.shape}")
 
+
 # =====================
 # Helper: fingerprint for an audio file
 # =====================
@@ -62,7 +63,6 @@ def make_fingerprint(path: str) -> np.ndarray:
     Load audio from 'path', compute a simple log-mel mean feature vector.
     Returns: np.ndarray of shape (N_MELS,)
     """
-    # librosa will try SoundFile first, then audioread (which can use ffmpeg, etc.)
     y, sr = librosa.load(path, sr=TARGET_SR, mono=True)
     if y.size == 0:
         raise ValueError("Empty audio after loading")
@@ -83,11 +83,10 @@ def best_match(query_feat: np.ndarray):
     Compare query_feat to all FEATS using cosine similarity.
     Returns: (best_index, similarity_score)
     """
-    # Normalize
     q = query_feat / (np.linalg.norm(query_feat) + 1e-8)
     f = FEATS / (np.linalg.norm(FEATS, axis=1, keepdims=True) + 1e-8)
 
-    sims = f @ q  # dot products -> cosine similarities
+    sims = f @ q
     idx = int(np.argmax(sims))
     score = float(sims[idx])
     return idx, score
@@ -114,16 +113,18 @@ def index():
 @app.route("/match", methods=["POST"])
 def match():
     """
-    Accepts audio either as:
+    Accepts audio as:
       1) JSON:  {"audio": "data:audio/webm;base64,AAA..."}
       2) multipart/form-data:  file field named "audio"
+      3) raw binary body: Content-Type like "audio/webm" or similar
 
     Returns JSON:
       { "match": "<track name>", "score": 0.92 }
     """
     raw_bytes = None
+    content_type = request.content_type or ""
 
-    # --------- Try JSON ----------
+    # --------- Case 1: JSON ----------
     if request.is_json:
         data = request.get_json(silent=True) or {}
         audio_b64 = data.get("audio")
@@ -132,16 +133,14 @@ def match():
             return jsonify({"error": "Missing 'audio' field in JSON"}), 400
 
         try:
-            # If it's a data URL, strip the header: "data:...;base64,XXXX"
             if "," in audio_b64:
                 audio_b64 = audio_b64.split(",", 1)[1]
             raw_bytes = base64.b64decode(audio_b64)
         except Exception as e:
             return jsonify({"error": f"Invalid base64 audio: {e}"}), 400
 
-    # --------- Try multipart/form-data ----------
-    else:
-        # We expect a file input named "audio"
+    # --------- Case 2: multipart/form-data ----------
+    elif "multipart/form-data" in content_type.lower():
         if "audio" not in request.files:
             return jsonify(
                 {"error": "No 'audio' file found in multipart/form-data"}
@@ -149,8 +148,17 @@ def match():
         file = request.files["audio"]
         raw_bytes = file.read()
 
+    # --------- Case 3: raw binary body (e.g. audio/webm) ----------
+    else:
+        # e.g. fetch(url, { method: "POST", body: blob });
+        raw_bytes = request.get_data(cache=False)
+
     if not raw_bytes:
-        return jsonify({"error": "Empty audio payload"}), 400
+        return jsonify(
+            {
+                "error": f"Empty audio payload (content_type={content_type})"
+            }
+        ), 400
 
     # --------- Save to temp .webm and fingerprint ----------
     tmp_path = None
@@ -170,7 +178,6 @@ def match():
         )
 
     except Exception as e:
-        # Any processing error -> 500
         return jsonify({"error": f"Failed to process audio: {e}"}), 500
 
     finally:
@@ -182,5 +189,4 @@ def match():
 
 
 if __name__ == "__main__":
-    # For local testing only; Render uses gunicorn with: gunicorn app:app
     app.run(host="0.0.0.0", port=5000, debug=True)
