@@ -1,180 +1,186 @@
 import os
+import base64
 import tempfile
+
 import numpy as np
 import librosa
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-from bgm_list import TRACKS  # we use this for the names
-
-# ------------------------------------------------
-# Basic config
-# ------------------------------------------------
-TARGET_SR = 22050
-N_MELS = 64
-HOP_LENGTH = 512
-
 app = Flask(__name__)
 CORS(app)
 
-# ------------------------------------------------
-# Load fingerprints.npz (be tolerant about keys)
-# ------------------------------------------------
-npz_path = "fingerprints.npz"
-if not os.path.exists(npz_path):
-    raise FileNotFoundError(f"{npz_path} not found in working directory")
+# =====================
+# Fingerprint parameters
+# =====================
+TARGET_SR = 22050
+HOP_LENGTH = 512
+N_MELS = 64
 
-data = np.load(npz_path, allow_pickle=True)
+# =====================
+# Load fingerprints.npz
+# =====================
+print("Loading fingerprints.npz ...")
+data = np.load("fingerprints.npz", allow_pickle=True)
 
-# Try some likely keys; otherwise just take the first array in the file
-possible_keys = ["feats", "fingerprints", "features", "fps"]
-fp_array = None
+FEATURE_KEYS = ["feats", "fingerprints", "features", "fps"]
+FEATS = None
+USED_KEY = None
 
-for k in possible_keys:
-    if k in data.files:
-        fp_array = data[k]
-        print(f"Loaded fingerprints from key '{k}'")
+for k in FEATURE_KEYS:
+    if k in data:
+        FEATS = data[k]
+        USED_KEY = k
         break
 
-if fp_array is None:
-    # fall back to "whatever is there"
-    first_key = data.files[0]
-    fp_array = data[first_key]
-    print(f"Loaded fingerprints from first key '{first_key}'")
-
-FINGERPRINTS = np.array(fp_array)
-
-if FINGERPRINTS.ndim != 2:
-    raise ValueError(
-        f"FINGERPRINTS should be 2D (tracks x features), "
-        f"but got shape {FINGERPRINTS.shape}"
+if FEATS is None:
+    raise KeyError(
+        "fingerprints.npz missing feature array "
+        "(expected one of: feats, fingerprints, features, fps)"
     )
 
-N_TRACKS = FINGERPRINTS.shape[0]
-print(f"Loaded {N_TRACKS} fingerprints from {npz_path}")
+if "names" in data:
+    NAMES = data["names"].tolist()
+else:
+    NAMES = [f"Track {i}" for i in range(FEATS.shape[0])]
 
-# sanity check with TRACKS length (not fatal, just warn)
-if len(TRACKS) != N_TRACKS:
-    print(
-        f"WARNING: TRACKS length ({len(TRACKS)}) != "
-        f"fingerprints rows ({N_TRACKS}). "
-        "Matching will still run but names may be misaligned."
-    )
+print(f"Loaded fingerprints from key '{USED_KEY}'")
+print(f"Loaded {FEATS.shape[0]} fingerprints from fingerprints.npz")
 
-# ------------------------------------------------
-# Fingerprint helpers
-# ------------------------------------------------
+# Make sure FEATS is 2D: (num_tracks, feature_dim)
+FEATS = np.asarray(FEATS)
+if FEATS.ndim != 2:
+    raise ValueError(f"FEATS must be 2D, got shape {FEATS.shape}")
+
+# =====================
+# Helper: fingerprint for an audio file
+# =====================
+
 def make_fingerprint(path: str) -> np.ndarray:
     """
-    Load an audio file and compute a simple log-mel mean fingerprint.
+    Load audio from 'path', compute a simple log-mel mean feature vector.
+    Returns: np.ndarray of shape (N_MELS,)
     """
+    # librosa will try SoundFile first, then audioread (which can use ffmpeg, etc.)
     y, sr = librosa.load(path, sr=TARGET_SR, mono=True)
     if y.size == 0:
-        raise ValueError("Empty audio signal")
+        raise ValueError("Empty audio after loading")
 
-    mel = librosa.feature.melspectrogram(
+    mels = librosa.feature.melspectrogram(
         y=y,
         sr=sr,
         n_mels=N_MELS,
         hop_length=HOP_LENGTH,
-        power=2.0,
     )
-    log_mel = librosa.power_to_db(mel, ref=np.max)
-    feat = log_mel.mean(axis=1)  # (N_MELS,)
-    return feat.astype(np.float32)
+    logmel = librosa.power_to_db(mels + 1e-10)
+    feat = logmel.mean(axis=1)  # (N_MELS,)
+    return feat
 
 
-def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+def best_match(query_feat: np.ndarray):
     """
-    Cosine similarity between 1D vectors.
+    Compare query_feat to all FEATS using cosine similarity.
+    Returns: (best_index, similarity_score)
     """
-    denom = (np.linalg.norm(a) * np.linalg.norm(b))
-    if denom == 0:
-        return 0.0
-    return float(np.dot(a, b) / denom)
+    # Normalize
+    q = query_feat / (np.linalg.norm(query_feat) + 1e-8)
+    f = FEATS / (np.linalg.norm(FEATS, axis=1, keepdims=True) + 1e-8)
+
+    sims = f @ q  # dot products -> cosine similarities
+    idx = int(np.argmax(sims))
+    score = float(sims[idx])
+    return idx, score
 
 
-def find_best_match(query_feat: np.ndarray):
-    """
-    Compare query_feat against all rows in FINGERPRINTS.
-    Returns (best_index, best_score).
-    """
-    if query_feat.ndim != 1:
-        raise ValueError("query_feat must be 1D")
+# =====================
+# Health check
+# =====================
 
-    scores = []
-    for i in range(N_TRACKS):
-        ref = FINGERPRINTS[i]
-        scores.append(cosine_sim(query_feat, ref))
+@app.route("/")
+def index():
+    return jsonify(
+        {
+            "status": "ok",
+            "tracks": len(NAMES),
+        }
+    )
 
-    scores = np.array(scores)
-    best_idx = int(scores.argmax())
-    best_score = float(scores[best_idx])
-    return best_idx, best_score
 
-# ------------------------------------------------
-# Routes
-# ------------------------------------------------
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "tracks": N_TRACKS})
-
+# =====================
+# /match endpoint
+# =====================
 
 @app.route("/match", methods=["POST"])
 def match():
     """
-    Expect: multipart/form-data with field name 'audio'
-    Frontend sends small WEBM/OGG/WAV chunks.
+    Accepts audio either as:
+      1) JSON:  {"audio": "data:audio/webm;base64,AAA..."}
+      2) multipart/form-data:  file field named "audio"
+
+    Returns JSON:
+      { "match": "<track name>", "score": 0.92 }
     """
-    if "audio" not in request.files:
-        return jsonify({"status": "error", "message": "Missing 'audio' file field"}), 400
+    raw_bytes = None
 
-    f = request.files["audio"]
+    # --------- Try JSON ----------
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+        audio_b64 = data.get("audio")
 
-    # Save to a temp file
-    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
-        tmp_path = tmp.name
-        f.save(tmp_path)
+        if not audio_b64:
+            return jsonify({"error": "Missing 'audio' field in JSON"}), 400
 
+        try:
+            # If it's a data URL, strip the header: "data:...;base64,XXXX"
+            if "," in audio_b64:
+                audio_b64 = audio_b64.split(",", 1)[1]
+            raw_bytes = base64.b64decode(audio_b64)
+        except Exception as e:
+            return jsonify({"error": f"Invalid base64 audio: {e}"}), 400
+
+    # --------- Try multipart/form-data ----------
+    else:
+        # We expect a file input named "audio"
+        if "audio" not in request.files:
+            return jsonify(
+                {"error": "No 'audio' file found in multipart/form-data"}
+            ), 400
+        file = request.files["audio"]
+        raw_bytes = file.read()
+
+    if not raw_bytes:
+        return jsonify({"error": "Empty audio payload"}), 400
+
+    # --------- Save to temp .webm and fingerprint ----------
+    tmp_path = None
     try:
-        # librosa can usually read webm/ogg via audioread+ffmpeg
-        q_feat = make_fingerprint(tmp_path)
-        best_idx, best_score = find_best_match(q_feat)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
+            tmp.write(raw_bytes)
+            tmp_path = tmp.name
 
-        # pick name from TRACKS if lengths match, else fallback
-        if best_idx < len(TRACKS):
-            best_name = TRACKS[best_idx]["name"]
-        else:
-            best_name = f"Track #{best_idx+1}"
+        query_feat = make_fingerprint(tmp_path)
+        idx, score = best_match(query_feat)
 
-        # simple threshold so we don’t shout random answers
-        THRESH = 0.7
-        if best_score < THRESH:
-            return jsonify({
-                "status": "no_match",
-                "score": best_score,
-                "message": "No confident match"
-            })
-
-        return jsonify({
-            "status": "ok",
-            "name": best_name,
-            "score": best_score
-        })
+        return jsonify(
+            {
+                "match": NAMES[idx],
+                "score": score,
+            }
+        )
 
     except Exception as e:
-        print("Error in /match:", repr(e))
-        return jsonify({"status": "error", "message": str(e)}), 500
-    finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
+        # Any processing error -> 500
+        return jsonify({"error": f"Failed to process audio: {e}"}), 500
 
-# ------------------------------------------------
-# Local dev entry
-# ------------------------------------------------
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 if __name__ == "__main__":
-    # For local testing only; Render uses gunicorn
+    # For local testing only; Render uses gunicorn with: gunicorn app:app
     app.run(host="0.0.0.0", port=5000, debug=True)
