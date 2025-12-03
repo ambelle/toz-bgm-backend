@@ -1,3 +1,6 @@
+import os
+os.environ["NUMBA_DISABLE_JIT"] = "1"  # 🔴 turn off numba JIT globally
+
 import io
 import traceback
 
@@ -5,6 +8,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import numpy as np
 import librosa
+
 
 # === Audio / fingerprint settings ===
 TARGET_SR = 22050
