@@ -1,144 +1,27 @@
 import os
+
+# Disable numba JIT (helps avoid numba/LLVM issues on some hosts)
+os.environ["NUMBA_DISABLE_JIT"] = "1"
+
 import io
-import wave
 import traceback
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import numpy as np
+import librosa
 
-# ==========================
-# Audio / fingerprint config
-# ==========================
 
-TARGET_SR = 22050       # resample everything here
-N_FFT = 1024            # so fingerprint dim = 1024//2 + 1 = 513
-SIM_THRESHOLD = 0.75    # similarity threshold for "confident" matches
+# === Audio / fingerprint settings ===
+TARGET_SR = 22050
+N_MELS = 64
+SIM_THRESHOLD = 0.75  # tweak if needed
 
 app = Flask(__name__)
 CORS(app)
 
-# ==========================
-# WAV loading (no librosa)
-# ==========================
 
-def load_wav_from_bytes(audio_bytes: bytes):
-    """
-    Load a PCM WAV (like the one sent from scanner.html) using stdlib wave.
-    Returns: y (float32, mono, -1..1), sr
-    """
-    bio = io.BytesIO(audio_bytes)
-    with wave.open(bio, "rb") as wf:
-        n_channels = wf.getnchannels()
-        sample_width = wf.getsampwidth()
-        sr = wf.getframerate()
-        n_frames = wf.getnframes()
-        raw = wf.readframes(n_frames)
-
-    if sample_width != 2:
-        # We only expect 16-bit PCM from our scanner.
-        raise ValueError(f"Unsupported sample width: {sample_width * 8} bits")
-
-    # int16 -> float32 in [-1, 1]
-    y = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-
-    if n_channels > 1:
-        # reshape (frames, channels) then average to mono
-        y = y.reshape(-1, n_channels).mean(axis=1)
-
-    return y, sr
-
-
-def resample_to_target(y: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    """
-    Very simple linear resampler using NumPy only.
-    Enough for this matching use-case.
-    """
-    if orig_sr == target_sr or y.size == 0:
-        return y.astype(np.float32)
-
-    # duration in seconds
-    duration = y.size / float(orig_sr)
-    new_length = int(round(duration * target_sr))
-
-    if new_length <= 1:
-        return y.astype(np.float32)
-
-    old_idx = np.linspace(0.0, 1.0, num=y.size, endpoint=False)
-    new_idx = np.linspace(0.0, 1.0, num=new_length, endpoint=False)
-    y_resampled = np.interp(new_idx, old_idx, y).astype(np.float32)
-    return y_resampled
-
-
-def compute_fingerprint(y: np.ndarray, sr: int) -> np.ndarray:
-    """
-    Simple, robust FFT-based fingerprint:
-
-    1) normalize
-    2) resample to TARGET_SR
-    3) frame into overlapping windows
-    4) rFFT magnitude per frame
-    5) average magnitude over time
-    6) log(1 + mag) and L2 normalize
-
-    Result shape: (N_FFT//2 + 1,) = (513,)
-    """
-    if y.size == 0:
-        raise ValueError("Empty audio signal")
-
-    # DC remove + amplitude normalize
-    y = y - np.mean(y)
-    max_abs = np.max(np.abs(y)) + 1e-8
-    y = y / max_abs
-
-    # resample to target SR
-    y = resample_to_target(y, sr, TARGET_SR)
-
-    if y.size < N_FFT:
-        # pad to at least one frame
-        pad = N_FFT - y.size
-        y = np.pad(y, (0, pad), mode="constant")
-
-    hop = N_FFT // 2  # 50% overlap
-    num_frames = 1 + (y.size - N_FFT) // hop
-    if num_frames <= 0:
-        num_frames = 1
-
-    frames = []
-    window = np.hanning(N_FFT).astype(np.float32)
-
-    for i in range(num_frames):
-        start = i * hop
-        end = start + N_FFT
-        if end > y.size:
-            frame = np.zeros(N_FFT, dtype=np.float32)
-            frame[:y.size - start] = y[start:]
-        else:
-            frame = y[start:end]
-
-        frame = frame * window
-        fft_mag = np.abs(np.fft.rfft(frame, n=N_FFT))
-        frames.append(fft_mag)
-
-    spec = np.mean(np.stack(frames, axis=0), axis=0)  # (513,)
-    spec = np.log1p(spec).astype(np.float32)
-
-    # L2 normalize
-    norm = np.linalg.norm(spec)
-    if norm > 0:
-        spec = spec / norm
-
-    return spec
-
-
-def make_fingerprint_from_bytes(audio_bytes: bytes) -> np.ndarray:
-    y, sr = load_wav_from_bytes(audio_bytes)
-    return compute_fingerprint(y, sr)
-
-
-# ==========================
-# Load fingerprints.npz
-# ==========================
+# === Load fingerprints once on startup ===
 
 F = None           # feature matrix (num_tracks, feat_dim)
 TRACK_NAMES = []   # list of track names
@@ -146,8 +29,9 @@ TRACK_NAMES = []   # list of track names
 try:
     data = np.load("fingerprints.npz", allow_pickle=True)
 
+    # Try common keys for features
     feat_key = None
-    for k in ("features", "feats", "fingerprints", "fps"):
+    for k in ("feats", "fingerprints", "features", "fps"):
         if k in data.files:
             feat_key = k
             break
@@ -155,11 +39,17 @@ try:
     if feat_key is None:
         raise KeyError(
             "fingerprints.npz missing feature array "
-            "(expected one of: features, feats, fingerprints, fps)"
+            "(expected one of: feats, fingerprints, features, fps)"
         )
 
     F = data[feat_key].astype(np.float32)
 
+    # 🔹 Ensure row-wise L2 normalization of stored fingerprints
+    norms = np.linalg.norm(F, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0
+    F = F / norms
+
+    # Try common keys for names
     name_key = None
     for k in ("names", "track_names", "labels"):
         if k in data.files:
@@ -173,7 +63,6 @@ try:
 
     print(f"Loaded fingerprints from key '{feat_key}'")
     print(f"Loaded {len(TRACK_NAMES)} fingerprints from fingerprints.npz")
-    print(f"Feature shape: {F.shape}")
 
 except Exception as e:
     print("Failed to load fingerprints:", e)
@@ -181,34 +70,58 @@ except Exception as e:
     TRACK_NAMES = []
 
 
-# ==========================
-# Matching
-# ==========================
+# === Helpers ===
+
+def make_fingerprint_from_bytes(audio_bytes: bytes) -> np.ndarray:
+    """
+    Decode WAV (or other supported format) from bytes,
+    compute a log-mel spectrogram, average over time,
+    and L2-normalize to get a vector.
+    """
+    bio = io.BytesIO(audio_bytes)
+
+    # librosa can load from a file-like object
+    y, sr = librosa.load(bio, sr=TARGET_SR, mono=True)
+
+    if y.size == 0:
+        raise ValueError("Empty decoded audio")
+
+    # Log-mel spectrogram
+    mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=N_MELS)
+    log_mel = librosa.power_to_db(mel, ref=np.max)
+
+    # Time-average -> 1D feature vector
+    feat = log_mel.mean(axis=1).astype(np.float32)
+
+    # L2 normalize
+    norm = np.linalg.norm(feat)
+    if norm > 0:
+        feat /= norm
+
+    return feat
+
 
 def find_best_match(query_fp: np.ndarray):
     """
     Cosine similarity between query and all stored fingerprints.
-    F is assumed L2-normalized row-wise.
+    F is assumed L2-normalized per-row.
     """
     if F is None or len(TRACK_NAMES) == 0:
         return None, 0.0
 
+    # ensure shape (1, D)
     q = query_fp.reshape(1, -1)
 
-    if q.shape[1] != F.shape[1]:
-        print(f"Feature dim mismatch: query {q.shape}, F {F.shape}")
-        return None, 0.0
-
+    # cosine similarity = dot product because all vectors are normalized
     sims = (F @ q.T).ravel()  # (num_tracks,)
     best_idx = int(np.argmax(sims))
     best_score = float(sims[best_idx])
     best_name = TRACK_NAMES[best_idx]
+
     return best_name, best_score
 
 
-# ==========================
-# Routes
-# ==========================
+# === Routes ===
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -216,7 +129,6 @@ def health():
         "ok": True,
         "loaded": F is not None,
         "tracks": len(TRACK_NAMES),
-        "feat_dim": int(F.shape[1]) if F is not None else 0,
     })
 
 
@@ -224,16 +136,18 @@ def health():
 def match():
     """
     Accepts:
-      - Raw audio bytes with Content-Type: audio/wav (from scanner.html)
+      - Raw audio bytes with Content-Type: audio/wav
       - OR legacy multipart/form-data with a file field named 'audio'
     """
     try:
         ct = request.content_type or ""
         audio_bytes = None
 
+        # New path: raw bytes (desktop & mobile)
         if ct.startswith("audio/"):
             audio_bytes = request.data
         else:
+            # Legacy path: multipart upload with <input name="audio">
             file = request.files.get("audio")
             if file:
                 audio_bytes = file.read()
@@ -247,7 +161,7 @@ def match():
         try:
             query_fp = make_fingerprint_from_bytes(audio_bytes)
         except Exception as e:
-            print("Error decoding / fingerprinting audio:", e)
+            print("Error decoding audio:", e)
             return jsonify({"error": "decode_failed"}), 400
 
         name, score = find_best_match(query_fp)
@@ -276,5 +190,5 @@ def match():
 
 
 if __name__ == "__main__":
-    # Local testing
+    # For local testing
     app.run(debug=True, host="0.0.0.0", port=5000)
