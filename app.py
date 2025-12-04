@@ -1,110 +1,96 @@
+import os
+os.environ["NUMBA_DISABLE_JIT"] = "1"  # Render + librosa safety
+
 import io
-import numpy as np
+import traceback
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import soundfile as sf     # Only needed to decode WAV/WEBM safely
+import numpy as np
+import librosa
+
+# === Config ===
+TARGET_SR = 22050
+N_MELS = 64
+
+# This is how strict we are when deciding "yes, this is the track"
+# You can tweak 0.90 → 0.85 or 0.93 later.
+SIM_THRESHOLD = 0.90
 
 app = Flask(__name__)
 CORS(app)
 
-TARGET_SR = 22050
-N_MELS = 64
+# === Load fingerprints.npz on startup ===
+F = None           # (num_tracks, feat_dim)
+TRACK_NAMES = []   # ["Henesys", "Perion", ...]
 
 
-# -----------------------------
-#  LOAD FINGERPRINTS
-# -----------------------------
-data = np.load("fingerprints.npz", allow_pickle=True)
+def _load_fingerprints():
+    global F, TRACK_NAMES
 
-F = data["feats"].astype(np.float32)
-names = [str(x) for x in data["names"]]
-
-# L2 normalize rows
-norms = np.linalg.norm(F, axis=1, keepdims=True)
-norms[norms == 0] = 1
-F = F / norms
-
-
-# -----------------------------
-#  UTIL: compute mel features
-# -----------------------------
-def mel_filterbank(sr, n_fft=2048, n_mels=64):
-    """Manually create mel filterbank (librosa-free)."""
-    # mel scale helpers
-    def hz_to_mel(hz): 
-        return 2595 * np.log10(1 + hz / 700)
-
-    def mel_to_hz(m): 
-        return 700 * (10**(m / 2595) - 1)
-
-    # mel scale
-    mel_min = hz_to_mel(0)
-    mel_max = hz_to_mel(sr / 2)
-    mels = np.linspace(mel_min, mel_max, n_mels + 2)
-    hz = mel_to_hz(mels)
-
-    # convert to FFT bins
-    bins = np.floor((n_fft + 1) * hz / sr).astype(int)
-
-    fb = np.zeros((n_mels, n_fft // 2 + 1))
-
-    for m in range(1, n_mels + 1):
-        f_m0 = bins[m - 1]
-        f_m1 = bins[m]
-        f_m2 = bins[m + 1]
-
-        if f_m0 < f_m1:
-            fb[m - 1, f_m0:f_m1] = (np.arange(f_m0, f_m1) - f_m0) / (f_m1 - f_m0)
-        if f_m1 < f_m2:
-            fb[m - 1, f_m1:f_m2] = (f_m2 - np.arange(f_m1, f_m2)) / (f_m2 - f_m1)
-
-    return fb
-
-
-MEL_FB = mel_filterbank(TARGET_SR, n_fft=2048, n_mels=N_MELS)
-
-
-def make_fingerprint_from_bytes(wav_bytes: bytes) -> np.ndarray:
-    """Decode WAV/WEBM → mel → log → mean → normalized vector."""
     try:
-        y, sr = sf.read(io.BytesIO(wav_bytes))
+        data = np.load("fingerprints.npz", allow_pickle=True)
+
+        # feature key
+        feat_key = None
+        for k in ("feats", "fingerprints", "features", "fps"):
+            if k in data.files:
+                feat_key = k
+                break
+        if feat_key is None:
+            raise KeyError(
+                "fingerprints.npz missing feature array "
+                "(expected one of: feats, fingerprints, features, fps)"
+            )
+
+        F = data[feat_key].astype(np.float32)
+
+        # L2-normalize each row just in case
+        norms = np.linalg.norm(F, axis=1, keepdims=True)
+        norms[norms == 0.0] = 1.0
+        F = F / norms
+
+        name_key = None
+        for k in ("names", "track_names", "labels"):
+            if k in data.files:
+                name_key = k
+                break
+
+        if name_key is not None:
+            TRACK_NAMES = [str(x) for x in data[name_key].tolist()]
+        else:
+            TRACK_NAMES = [f"Track {i}" for i in range(F.shape[0])]
+
+        print(f"[INIT] Loaded {F.shape[0]} fingerprints from key '{feat_key}'")
+        print(f"[INIT] Example names: {TRACK_NAMES[:5]}")
+
     except Exception as e:
-        raise ValueError(f"soundfile failed: {e}")
+        print("[INIT] Failed to load fingerprints.npz:", e)
+        F = None
+        TRACK_NAMES = []
 
-    if y.ndim > 1:
-        y = y.mean(axis=1)
 
-    # resample if needed
-    if sr != TARGET_SR:
-        # simple linear resample
-        x_old = np.linspace(0, 1, len(y))
-        x_new = np.linspace(0, 1, int(len(y) * TARGET_SR / sr))
-        y = np.interp(x_new, x_old, y)
+_load_fingerprints()
 
-    # STFT
-    n_fft = 2048
-    hop = 512
+# === Helpers ===
 
-    frames = []
-    for i in range(0, len(y) - n_fft, hop):
-        win = y[i:i+n_fft] * np.hanning(n_fft)
-        spec = np.abs(np.fft.rfft(win))
-        frames.append(spec)
 
-    if len(frames) == 0:
-        raise ValueError("Not enough audio")
+def make_fingerprint_from_bytes(audio_bytes: bytes) -> np.ndarray:
+    """
+    Decode audio from bytes, compute log-mel spectrogram,
+    average over time, L2-normalize → (N_MELS,) vector.
+    """
+    bio = io.BytesIO(audio_bytes)
+    y, sr = librosa.load(bio, sr=TARGET_SR, mono=True)
 
-    S = np.array(frames).T  # shape (freq, time)
+    if y.size == 0:
+        raise ValueError("Empty decoded audio")
 
-    # mel projection
-    mel = MEL_FB @ S
-
-    mel = np.maximum(mel, 1e-9)
-    log_mel = np.log10(mel)
-
+    mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=N_MELS)
+    log_mel = librosa.power_to_db(mel, ref=np.max)
     feat = log_mel.mean(axis=1).astype(np.float32)
 
-    # normalize
+    # L2 normalize
     norm = np.linalg.norm(feat)
     if norm > 0:
         feat /= norm
@@ -112,36 +98,139 @@ def make_fingerprint_from_bytes(wav_bytes: bytes) -> np.ndarray:
     return feat
 
 
-# -----------------------------
-#  MATCH ENDPOINT
-# -----------------------------
-@app.route("/match", methods=["POST"])
-def match():
-    raw = request.data
-    if not raw:
-        return jsonify({"error": "No audio received"}), 400
+def find_best_match(query_fp: np.ndarray):
+    """
+    Cosine similarity between query and all stored fingerprints.
+    F is assumed L2-normalized row-wise.
+    Returns (best_name or None, best_score).
+    """
+    if F is None or len(TRACK_NAMES) == 0:
+        return None, 0.0
 
+    q = query_fp.reshape(1, -1)
+
+    sims = (F @ q.T).ravel()  # (num_tracks,)
+    best_idx = int(np.argmax(sims))
+    best_score = float(sims[best_idx])
+
+    # NaN / inf safety
+    if not np.isfinite(best_score):
+        best_score = 0.0
+
+    best_name = TRACK_NAMES[best_idx]
+
+    # Debug log top-3 to Render logs (optional but very useful)
     try:
-        q = make_fingerprint_from_bytes(raw)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        top3_idx = np.argsort(sims)[-3:][::-1]
+        top3 = [(TRACK_NAMES[i], float(sims[i])) for i in top3_idx]
+        print(f"[MATCH] Top3: {top3}")
+    except Exception:
+        pass
 
-    sims = F @ q
-    idx = int(np.argmax(sims))
-    score = float(sims[idx])
+    return best_name, best_score
 
-    result = names[idx]
 
+# === Routes ===
+
+
+@app.route("/health", methods=["GET"])
+def health():
     return jsonify({
-        "match": result,
-        "confidence": round(score, 4)
+        "ok": True,
+        "loaded": F is not None,
+        "tracks": len(TRACK_NAMES),
     })
 
 
-@app.route("/")
-def health():
-    return "BGM Matcher Running"
+@app.route("/match", methods=["POST"])
+def match():
+    """
+    Accepts:
+      - Raw audio bytes with Content-Type: audio/wav
+      - OR multipart/form-data with field 'audio'
+    Returns JSON with:
+      ok, match, confidence, threshold, is_confident
+    """
+    try:
+        ct = request.content_type or ""
+        audio_bytes = None
+
+        # Raw wav from scanner.html
+        if ct.startswith("audio/"):
+            audio_bytes = request.data
+        else:
+            # Fallback: multipart upload
+            file = request.files.get("audio")
+            if file:
+                audio_bytes = file.read()
+
+        if not audio_bytes:
+            print(f"[MATCH] 400: no audio bytes, content_type={ct}")
+            return jsonify({
+                "ok": False,
+                "error": "no_audio",
+                "match": None,
+                "confidence": 0.0,
+                "threshold": float(SIM_THRESHOLD),
+                "is_confident": False,
+            }), 400
+
+        print(f"[MATCH] received {len(audio_bytes)} bytes, content_type={ct}")
+
+        try:
+            query_fp = make_fingerprint_from_bytes(audio_bytes)
+        except Exception as e:
+            print("[MATCH] Error decoding audio:", e)
+            return jsonify({
+                "ok": False,
+                "error": "decode_failed",
+                "match": None,
+                "confidence": 0.0,
+                "threshold": float(SIM_THRESHOLD),
+                "is_confident": False,
+            }), 400
+
+        name, score = find_best_match(query_fp)
+
+        # If similarity is too low, treat as "no match"
+        if name is None or score < 0.1:
+            resp = {
+                "ok": True,
+                "match": None,
+                "confidence": float(score),
+                "threshold": float(SIM_THRESHOLD),
+                "is_confident": False,
+            }
+            print(f"[MATCH] No match (score={score:.3f})")
+            return jsonify(resp)
+
+        is_confident = bool(score >= SIM_THRESHOLD)
+
+        resp = {
+            "ok": True,
+            "match": name,
+            "confidence": float(score),
+            "threshold": float(SIM_THRESHOLD),
+            "is_confident": is_confident,
+        }
+
+        print(f"[MATCH] best='{name}' score={score:.3f} "
+              f"confident={is_confident} (threshold={SIM_THRESHOLD})")
+
+        return jsonify(resp)
+
+    except Exception:
+        print("[MATCH] Error in /match:", traceback.format_exc())
+        return jsonify({
+            "ok": False,
+            "error": "server_error",
+            "match": None,
+            "confidence": 0.0,
+            "threshold": float(SIM_THRESHOLD),
+            "is_confident": False,
+        }), 500
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    # Local testing
+    app.run(debug=True, host="0.0.0.0", port=5000)
